@@ -1,0 +1,181 @@
+# See https://wiki.debian.org/RaspberryPi3 for known issues and more details.
+# image.yml based on revision: __GITCOMMIT__
+
+steps:
+  - mkimg: "{{ output }}"
+    size: 2000M
+
+  - mklabel: msdos
+    device: "{{ output }}"
+
+  - mkpart: primary
+    fs-type: 'fat32'
+    device: "{{ output }}"
+    start: 4MiB
+    end: 20%
+    tag: /boot
+
+  - mkpart: primary
+    device: "{{ output }}"
+    start: 20%
+    end: 100%
+    tag: /
+
+  - kpartx: "{{ output }}"
+
+  - mkfs: vfat
+    partition: /boot
+    label: RASPIFIRM
+
+  - mkfs: ext4
+    partition: /
+    label: RASPIROOT
+
+  - mount: /
+
+  - mount: /boot
+    mount-on: /
+    dirname: '/boot/firmware'
+
+  - unpack-rootfs: /
+
+  - qemu-debootstrap: __RELEASE__
+    mirror: http://depo.pardus.org.tr/pardus
+    target: /
+    arch: __ARCH__
+    components:
+    - main
+    - contrib
+    - non-free
+    unless: rootfs_unpacked
+
+  - create-file: /etc/apt/sources.list
+    contents: |+
+      deb http://depo.pardus.org.tr/pardus __RELEASE__ main contrib non-free
+      deb http://depo.pardus.org.tr/guvenlik __RELEASE__ main contrib non-free
+      __BACKPORTS__
+
+    unless: rootfs_unpacked
+
+  - copy-file: /etc/initramfs-tools/hooks/rpi-resizerootfs
+    src: rootfs/etc/initramfs-tools/hooks/rpi-resizerootfs
+    perm: 0755
+    unless: rootfs_unpacked
+
+  - copy-file: /etc/initramfs-tools/scripts/local-bottom/rpi-resizerootfs
+    src: rootfs/etc/initramfs-tools/scripts/local-bottom/rpi-resizerootfs
+    perm: 0755
+    unless: rootfs_unpacked
+
+  - chroot: /
+    shell: |
+      apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 88561f1612b98175
+    shell: |
+      apt-get update
+    unless: rootfs_unpacked
+
+  - apt: install
+    packages:
+    - pardus-archive-keyring
+    - ca-certificates
+    - dosfstools
+    - iw
+    - parted
+    - ssh
+    - wpasupplicant
+    - __SYSTEMD_TIMESYNCD__
+    - __LINUX_IMAGE__
+    - __RASPI_FIRMWARE__
+    - __WIRELESS_FIRMWARE__
+    tag: /
+    unless: rootfs_unpacked
+
+  - cache-rootfs: /
+    unless: rootfs_unpacked
+
+  - shell: |
+      echo "__HOST__-$(date +%Y%m%d)" > "${ROOT?}/etc/hostname"
+
+      # Allow root logins locally with no password
+      sed -i 's,root:[^:]*:,root::,' "${ROOT?}/etc/shadow"
+
+      install -m 644 -o root -g root rootfs/etc/fstab "${ROOT?}/etc/fstab"
+
+      install -m 644 -o root -g root rootfs/etc/network/interfaces.d/eth0 "${ROOT?}/etc/network/interfaces.d/eth0"
+      install -m 600 -o root -g root rootfs/etc/network/interfaces.d/wlan0 "${ROOT?}/etc/network/interfaces.d/wlan0"
+
+      install -m 755 -o root -g root rootfs/usr/local/sbin/rpi-set-sysconf "${ROOT?}/usr/local/sbin/rpi-set-sysconf"
+      install -m 644 -o root -g root rootfs/etc/systemd/system/rpi-set-sysconf.service "${ROOT?}/etc/systemd/system/"
+      install -m 644 -o root -g root rootfs/boot/firmware/sysconf.txt "${ROOT?}/boot/firmware/sysconf.txt"
+      mkdir -p "${ROOT?}/etc/systemd/system/basic.target.requires/"
+      ln -s /etc/systemd/system/rpi-set-sysconf.service "${ROOT?}/etc/systemd/system/basic.target.requires/rpi-set-sysconf.service"
+
+      # Resize script is now in the initrd for first boot; no need to ship it.
+      rm -f "${ROOT?}/etc/initramfs-tools/hooks/rpi-resizerootfs"
+      rm -f "${ROOT?}/etc/initramfs-tools/scripts/local-bottom/rpi-resizerootfs"
+
+      install -m 644 -o root -g root rootfs/etc/systemd/system/rpi-reconfigure-raspi-firmware.service "${ROOT?}/etc/systemd/system/"
+      mkdir -p "${ROOT?}/etc/systemd/system/multi-user.target.requires/"
+      ln -s /etc/systemd/system/rpi-reconfigure-raspi-firmware.service "${ROOT?}/etc/systemd/system/multi-user.target.requires/rpi-reconfigure-raspi-firmware.service"
+      __FIX_FIRMWARE_PKG_NAME__
+
+      install -m 644 -o root -g root rootfs/etc/systemd/system/rpi-generate-ssh-host-keys.service "${ROOT?}/etc/systemd/system/"
+      ln -s /etc/systemd/system/rpi-generate-ssh-host-keys.service "${ROOT?}/etc/systemd/system/multi-user.target.requires/rpi-generate-ssh-host-keys.service"
+      rm -f "${ROOT?}"/etc/ssh/ssh_host_*_key*
+
+      __EXTRA_ROOT_SHELL_CMDS__
+    root-fs: /
+
+  # Copy the relevant device tree files to the boot partition
+  - chroot: /
+    shell: |
+      install -m 644 -o root -g root __DTB__ /boot/firmware/
+
+  # Clean up archive cache (likely not useful) and lists (likely outdated) to
+  # reduce image size by several hundred megabytes.
+  - chroot: /
+    shell: |
+      apt-get clean
+      rm -rf /var/lib/apt/lists
+
+  # Modify the kernel commandline we take from the firmware to boot from
+  # the partition labeled raspiroot instead of forcing it to mmcblk0p2.
+  # Also insert the serial console right before the root= parameter.
+  #
+  # These changes will be overwritten after the hardware is probed
+  # after dpkg reconfigures raspi-firmware (upon first boot), so make
+  # sure we don't lose label-based booting.
+  - chroot: /
+    shell: |
+      sed -i 's/root=/console=__SERIAL_CONSOLE__ root=/' /boot/firmware/cmdline.txt
+      sed -i 's#root=/dev/mmcblk0p2#root=LABEL=RASPIROOT#' /boot/firmware/cmdline.txt
+      sed -i 's/^#ROOTPART=.*/ROOTPART=LABEL=RASPIROOT/' /etc/default/raspi*-firmware
+
+      __EXTRA_CHROOT_SHELL_CMDS__
+
+  # TODO(https://github.com/larswirzenius/vmdb2/issues/24): remove once vmdb
+  # clears /etc/resolv.conf on its own.
+  - shell: |
+      rm "${ROOT?}/etc/resolv.conf"
+    root-fs: /
+
+  # Clear /etc/machine-id and /var/lib/dbus/machine-id, as both should
+  # be auto-generated upon first boot. From the manpage
+  # (machine-id(5)):
+  #
+  #   For normal operating system installations, where a custom image is
+  #   created for a specific machine, /etc/machine-id should be
+  #   populated during installation.
+  #
+  # Note this will also trigger ConditionFirstBoot=yes for systemd.
+  # On Buster, /etc/machine-id should be an emtpy file, not an absent file
+  # On Bullseye, /etc/machine-id should not exist in an image
+  - chroot: /
+    shell: |
+      rm -f /etc/machine-id /var/lib/dbus/machine-id
+      __TOUCH_MACHINE_ID__
+
+  # Create /etc/raspi-image-id to know, from what commit the image was built
+  - chroot: /
+    shell: |
+      echo "image based on revision: __GITCOMMIT__ and build on __BUILDTIME__ (UTC)" > "/etc/raspi-image-id"
